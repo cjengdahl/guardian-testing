@@ -1,6 +1,8 @@
-import subprocess
-import sqlite3
 import hashlib
+import sqlite3
+import subprocess
+
+# Kick for trigger
 
 
 def get_user(username):
