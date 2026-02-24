@@ -41,7 +41,7 @@ jobs:
 
       - name: Process with Guardian
         if: steps.changed-files.outputs.files != ''
-        uses: SecurityJourney/guardian-action@v1
+        uses: SecurityJourney/guardian-action@trunk
         with:
           scan_results_path: scan-results.json
           instruction_file_path: .claude/CLAUDE.md
