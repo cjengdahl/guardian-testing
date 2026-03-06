@@ -1,52 +1,42 @@
 # AI Code Assistant — Secure Coding & Generation Instructions
 
-- Revision checklist (high-level)
-  - Replace any use of shell=True, os.system, popen with shell=True, or unvalidated shell strings with safe subprocess usage (list args, shell=False), tool existence checks, and strict validation/whitelisting.
-  - Replace all string-built SQL (f-strings, %-formatting, concatenation) with DB-API parameterized queries or ORM; validate any dynamic identifiers via server-side whitelist.
-  - Replace MD5/SHA1 for security-sensitive uses with Argon2/Bcrypt/Scrypt for passwords and SHA-256+ for non-security checksums; allow MD5 only for non-security deduplication with usedforsecurity=False and documented justification.
-  - Enforce CI checks (Bandit + explicit grep patterns) that fail on regressions (forbidden subprocess patterns, unparameterized SQL, md5/sha1 usage); add pre-commit hooks and PR diff scanning.
-  - Ensure assistant refuses to produce any forbidden pattern and always returns a secure alternative with validation and error handling examples.
-
 ## Purpose
-Provide concise, enforceable rules so the AI Code Assistant will not generate code that reproduces recurring security problems (unsafe subprocess usage, shell=True, string-built SQL injection, and MD5/SHA1 for security). These rules are mandatory for any code produced by the assistant for this repository.
+Provide concise, enforceable rules so the AI Code Assistant will not generate code that reproduces recurring security problems (unsafe subprocess usage, shell=True, string-built SQL injection, and MD5/SHA1 for security). These rules are mandatory for any code produced by the assistant for this repository and are tuned to prevent the vulnerabilities flagged by automated scans (subprocess shell use, general subprocess risks, stringed SQL, and MD5 usage).
 
-## High-level policy (must be followed by the assistant)
+## High-level policy (must be followed)
 - The assistant must never output code that:
-  - Uses subprocess with shell=True, subprocess.Popen(..., shell=True), os.system(), or any pattern that constructs shell strings from untrusted input.
-  - Constructs SQL statements with f-strings, %-formatting, or string concatenation that include untrusted values.
-  - Uses MD5 or SHA1 for password hashing, token signing, HMAC keys, or any security-sensitive functionality.
-- When asked for insecure examples, the assistant must:
-  - Refuse to provide the insecure pattern.
-  - Provide a secure alternative, a brief rationale, and example code that includes input validation and sanitized error handling.
-- All examples and generated code must prefer library APIs over shelling out. If shelling out is necessary, require a justification in code comments and the PR description.
+  - Uses subprocess with shell=True, subprocess.Popen(..., shell=True), os.system(), popen with shell strings, or any pattern that executes a constructed shell string from untrusted input.
+  - Constructs SQL statements by f-strings, %-formatting, or string concatenation that include untrusted values.
+  - Uses hashlib.md5(...) or hashlib.sha1(...) for password hashing, token signing, HMAC, or any security-sensitive functionality.
+- If asked for insecure examples, the assistant must refuse to provide the insecure pattern, briefly explain why it's insecure, and supply a secure alternative with validation and sanitized error handling.
+- Prefer library APIs over shelling out (e.g., tarfile, shutil, GitPython, builtin DB drivers, ORMs, argon2 libraries).
 
-## Forbidden patterns (do not generate)
-- Any subprocess/OS invocation with shell=True or direct shell string execution (os.system, subprocess.run(..., shell=True), subprocess.Popen(..., shell=True)).
+## Forbidden patterns (strict)
+Do not generate any code that contains the following patterns:
+- subprocess.run(..., shell=True), subprocess.Popen(..., shell=True), os.system(...), os.popen(...), or any shell invocation that builds a shell command string from user input.
 - Passing unsanitized/unvalidated user input into subprocess commands or arguments.
-- SQL constructed by f-strings, %-formatting, or concatenation containing user-controlled data.
-- Use of hashlib.md5(...) or hashlib.sha1(...) for authentication, password hashing, token signing, or HMAC. (MD5 allowed only for legacy non-security deduplication with usedforsecurity=False and documented justification.)
+- SQL built with f-strings, %-formatting, or string concatenation that interpolate user-controlled values.
+- hashlib.md5(...) or hashlib.sha1(...) for authentication, password hashing, token signing, or HMAC. MD5 is permitted only for legacy non-security deduplication under strict conditions (see Hashing rules).
 
 ## Subprocess & shell execution rules
-- Preferred:
-  - Use library APIs whenever possible (e.g., Python tarfile, shutil, GitPython for Git ops, etc.).
-  - If an external command is required, always call subprocess with a sequence (list/tuple) of arguments and shell=False.
-  - Validate the command and arguments: use shutil.which() to ensure the executable exists and whitelist/validate user-supplied arguments (filenames, flags).
-  - Use subprocess.run(args, check=True, capture_output=True, text=True) and catch subprocess.CalledProcessError. Sanitize error messages before logging or re-raising.
-  - Limit allowed external commands to a strict whitelist when possible and enforce least privilege.
-- Required input validation:
-  - Validate type and shape of argument lists.
-  - Strictly validate filenames (no .., absolute paths only when allowed, match allowed patterns, enforce ownership/permissions checks if applicable).
-  - Reject or sanitize any argument containing shell metacharacters if it originates from untrusted input.
-- Error handling:
-  - Do not expose raw exception tracebacks or command output to end-users. Log sanitized diagnostics to internal logs and return user-safe error messages.
-- Safe subprocess example:
+- Prefer library APIs for operations (file extraction, compression, VCS operations, JSON processing).
+- If an external command is required:
+  - Always use sequence form and shell=False: subprocess.run([...], check=True, capture_output=True, text=True).
+  - Validate executable existence with shutil.which() and restrict allowed commands to a strict server-side whitelist.
+  - Validate every user-supplied argument: enforce types, maximum lengths, deny shell metacharacters, ban "../" unless explicitly allowed and canonicalize paths.
+  - Disallow any argument that originates from an untrusted source unless explicitly validated/whitelisted.
+  - Catch subprocess.CalledProcessError, log sanitized diagnostics internally, and return a generic, user-safe error message.
+- Do not expose raw stdout/stderr or stack traces to end users.
+- Use least privilege: avoid running commands as root; if escalation is necessary document justification in PR and limit scope.
+
+### Safe subprocess example
 ```python
 import shutil
 import subprocess
 import re
 from typing import Sequence
 
-ALLOWED_COMMANDS = {"tar", "gzip", "jq"}  # example whitelist
+ALLOWED_COMMANDS = {"tar", "gzip", "jq"}  # server-side whitelist
 _ALLOWED_FILENAME = re.compile(r"^[a-zA-Z0-9_\-./]+$")
 
 def _validate_filename(name: str) -> str:
@@ -65,7 +55,7 @@ def run_command(args: Sequence[str]) -> str:
         raise ValueError("command not permitted")
     if shutil.which(args[0]) is None:
         raise FileNotFoundError(f"Command not found: {args[0]}")
-    # Validate other args explicitly (example for a single filename)
+    # Validate additional args explicitly
     if len(args) > 1:
         _ = _validate_filename(args[1])
     try:
@@ -76,39 +66,40 @@ def run_command(args: Sequence[str]) -> str:
         # logger.error("external command failed: %s exit=%s", args[0], e.returncode)
         raise RuntimeError("external command failed") from e
 ```
-- Prohibited example (assistant must refuse to generate):
+
+### Prohibited example (assistant must refuse)
 ```python
 # DO NOT GENERATE
 subprocess.run(f"tar -xzf {user_input}", shell=True)
 ```
-- Safer alternative (assistant must offer):
+
+### Safer alternative (assistant must offer)
 ```python
 # Validate filename strictly and pass as list; do not use shell=True
-user_file = sanitize_filename(user_input)
+user_file = _validate_filename(user_input)
 subprocess.run(["tar", "-xzf", user_file], check=True, capture_output=True, text=True)
 ```
 
 ## SQL query construction rules
-- Forbidden:
-  - Building SQL via f-strings, %-formatting, or string concatenation when user input is present.
-- Required:
-  - Use DB-API parameterized queries (cursor.execute(query, params)) or a vetted ORM (SQLAlchemy, Django ORM) for all queries that include user data.
-  - If dynamic SQL identifiers are required (table/column names, ORDER BY columns), validate them against a server-side whitelist before interpolating them into SQL. Do not accept client-provided identifiers without server-side validation.
-  - Validate types and ranges for numeric parameters and enforce maximum lengths for strings.
-  - Use explicit error handling for database exceptions and do not leak SQL or parameter values in error messages.
-- Safe SQL examples:
+- Always use DB-API parameterized queries or a vetted ORM. Forbidden: f-strings, %-formatting, concatenation for queries with user input.
+- If dynamic identifiers (table, column, ORDER BY) are necessary, validate them against a server-side whitelist before interpolation. Never accept client-provided identifiers without server-side validation.
+- Validate types, ranges, and maximum lengths for numeric and string parameters.
+- Catch database exceptions and do not return SQL or parameter values to clients; log sanitized errors internally.
+
+### Safe SQL examples
 ```python
 # Parameterized DB-API (sqlite3 example)
 import sqlite3
 from typing import Optional
 
 def get_user_by_email(conn: sqlite3.Connection, email: str) -> Optional[sqlite3.Row]:
-    if not isinstance(email, str) or "@" not in email:
+    if not isinstance(email, str) or "@" not in email or len(email) > 254:
         raise ValueError("invalid email")
     cur = conn.cursor()
     cur.execute("SELECT id, email FROM users WHERE email = ?", (email,))
     return cur.fetchone()
 ```
+
 ```python
 # Whitelist dynamic identifiers
 ALLOWED_SORT_COLS = {"id", "email", "created_at"}
@@ -116,22 +107,22 @@ ALLOWED_SORT_COLS = {"id", "email", "created_at"}
 def fetch_sorted(conn: sqlite3.Connection, sort_col: str):
     if sort_col not in ALLOWED_SORT_COLS:
         raise ValueError("invalid sort column")
-    query = f"SELECT id, email FROM users ORDER BY {sort_col} DESC"  # safe because of whitelist
+    query = f"SELECT id, email FROM users ORDER BY {sort_col} DESC"  # safe via whitelist
     cur = conn.cursor()
     cur.execute(query)
     return cur.fetchall()
 ```
-- Example of refusing insecure pattern:
-  - If a user requests code that builds SQL via f-strings with user data, respond: “I cannot provide that insecure pattern. Here is a parameterized alternative...” and include validated examples.
 
 ## Hashing and password storage rules
-- Forbidden:
-  - Use of MD5 or SHA1 for password hashing, token signing, HMAC, or any security-sensitive function.
-- Required:
-  - Use Argon2 (argon2-cffi) or passlib wrappers for password hashing. Acceptable alternatives: bcrypt or scrypt if Argon2 is not available and with documented justification.
-  - Use SHA-256 or stronger (e.g., SHA-3) for non-security checksums and integrity tasks.
-  - If MD5 must be used for non-security legacy deduplication, call hashlib.md5(..., usedforsecurity=False) (Python 3.9+) and document the reason in code comments and PR description; require an explicit security review and approval.
-- Password hashing example (argon2-cffi):
+- Forbidden: MD5 or SHA1 for password hashing, token signing, HMAC, or any security-sensitive function.
+- Required: use Argon2 (argon2-cffi) or passlib wrappers for password hashing. Acceptable alternatives: bcrypt or scrypt only if Argon2 is not available (document justification).
+- Use SHA-256+ for non-security integrity or checksums.
+- MD5 is allowed only for non-security legacy deduplication and only if:
+  - The code calls hashlib.md5(..., usedforsecurity=False) (Python 3.9+), and
+  - The use is documented in code comments and the PR description, and
+  - A security review/approval is recorded in the PR and central exceptions file.
+
+### Password hashing example (argon2-cffi)
 ```python
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
@@ -149,7 +140,8 @@ def verify_password(stored_hash: str, password: str) -> bool:
     except VerifyMismatchError:
         return False
 ```
-- Non-security checksum example (SHA-256):
+
+### Non-security checksum example (SHA-256)
 ```python
 import hashlib
 
@@ -158,11 +150,12 @@ def sha256_checksum(data: bytes) -> str:
         raise ValueError("data must be bytes")
     return hashlib.sha256(data).hexdigest()
 ```
-- MD5 allowed only with explicit justification:
+
+### Explicit legacy MD5 example (only with review)
 ```python
 import hashlib
 
-# MD5 used ONLY for non-security deduplication (legacy). Security review required;
+# MD5 used ONLY for legacy non-security deduplication. Security review required;
 # do not use for authentication, signing, or HMAC.
 def md5_dedup(data: bytes) -> str:
     return hashlib.md5(data, usedforsecurity=False).hexdigest()
@@ -171,12 +164,16 @@ def md5_dedup(data: bytes) -> str:
 ## Assistant refusal and remediation behavior
 - If the user requests code containing any forbidden pattern, the assistant must:
   - Refuse to provide that insecure pattern.
-  - Explain briefly why it is insecure (one sentence).
-  - Provide a secure alternative with input validation, error handling, and minimal comments explaining choices.
-- All generated code samples must be ready for production review (no toy validation only).
+  - Explain in one sentence why it is insecure (e.g., "Using shell=True allows command injection from untrusted input.").
+  - Provide a secure alternative with:
+    - Input validation (types, lengths, allowed characters, path canonicalization).
+    - Whitelisting where applicable (commands, SQL identifiers).
+    - Proper error handling (catching, sanitizing logs, user-friendly messages).
+    - Short code comment(s) explaining choices.
+- All generated examples must be production-ready for security review (not toy-only validation).
 
 ## CI & automated enforcement
-- Add security scanning to CI and fail builds on forbidden patterns (shell=True, os.system, unparameterized SQL via f-strings/concatenation, md5/sha1 usage for security). Use Bandit and explicit pattern checks on the diff.
+- Add a GitHub Actions security job that runs Bandit and enforces explicit grep patterns on diffs and the repo. It must fail the build on detection of forbidden patterns.
 - Example GitHub Actions job:
 ```yaml
 name: Security Scan
@@ -199,32 +196,38 @@ jobs:
       - name: Fail on forbidden patterns
         run: |
           set -e
-          # Patterns to detect unsafe usage: shell=True, os.system(, subprocess.*shell=, f"SELECT, % formatting SQL, hashlib.md5, hashlib.sha1
-          if git --no-pager grep -n --line-number -E "shell=True|os\\.system\\(|subprocess\\.[A-Za-z_]+\\(.*shell=|f\".*SELECT|%(\\s*\\(|\\bhashlib\\.md5\\b|\\bhashlib\\.sha1\\b" -- ':!venv/*' ; then
+          # Detect forbidden patterns in changed files (exclude venv)
+          if git --no-pager grep -n --line-number -E "shell=True|subprocess\\..*shell=|\\bos\\.system\\(|\\bos\\.popen\\(|f\".*SELECT|f'.*SELECT|%\\s*\\(|\\bhashlib\\.md5\\b|\\bhashlib\\.sha1\\b" -- ':!venv/*' ; then
             echo "Forbidden security patterns detected"; exit 1
           fi
 ```
-- Pre-commit and PR bot recommendations:
-  - Add pre-commit hooks to run Bandit and the same grep patterns; block commits that match.
-  - Run a PR diff scanner that comments on files added/modified if forbidden patterns are present and fail CI with actionable remediation steps.
-- CI policy: failing the security job must block merging until resolved and approved.
+- The CI must:
+  - Fail the PR if forbidden patterns are introduced anywhere in the diff.
+  - Provide actionable remediation messages linking to secure examples in this document.
+
+## Pre-commit hooks & PR bot
+- Add pre-commit hooks to run:
+  - bandit
+  - the same grep detection used in CI
+- Configure a PR bot to scan diffs and post inline comments for any forbidden patterns and block merging until resolved.
+- Pre-commit should be configured to block commits with matches and provide guidance to replace with secure alternatives.
 
 ## Minimal PR reviewer checklist (apply to AI-generated PRs)
-- No use of shell=True, os.system(), or unvalidated shell strings.
-- All subprocess invocations use list arguments, shutil.which checks, and proper error handling or are replaced with library APIs.
-- No SQL constructed via f-strings/concatenation with untrusted input; parameters or ORM used. Any dynamic identifiers validated by whitelist.
-- No MD5/SHA1 used for authentication/signing; Argon2/Bcrypt used for passwords.
-- CI passes Bandit and custom pattern checks.
+- No use of shell=True, subprocess.* with shell=True, os.system(), or os.popen() on modified lines.
+- All subprocess invocations use list arguments, shutil.which checks, whitelists, and explicit validation.
+- No SQL constructed via f-strings/concatenation with user input; parameterized queries or ORM used. Any interpolated identifier validated with a server-side whitelist.
+- No hashlib.md5 or hashlib.sha1 used for security-sensitive purposes. Argon2/Bcrypt used for passwords.
+- CI security job and pre-commit hooks pass for the PR diff.
 
-## Maintenance & exceptions
-- Keep this file adjacent to AI tooling configuration and update when new scan patterns or vulnerabilities appear.
+## Exceptions & maintenance
 - Exceptions (e.g., legacy MD5) are allowed only with:
-  - A code comment explaining non-security-only use.
-  - Use of hashlib.md5(..., usedforsecurity=False) where supported.
-  - An explicit entry in the PR description documenting the business justification and an approved security review.
-- Record and document any approved exceptions in a central security exceptions file and add an expiration/review date.
+  - Inline code comment documenting non-security-only use.
+  - Call to hashlib.md5(..., usedforsecurity=False) where supported.
+  - A documented business justification in the PR description.
+  - Explicit security review and recorded approval in a central exceptions registry (create SECURITY_EXCEPTIONS.md).
+- Review this file whenever new scan patterns or vulnerabilities appear and update CI/grep rules accordingly.
 
-## Concise examples — forbidden vs allowed
+## Quick reference — forbidden vs allowed
 Forbidden:
 ```python
 # DO NOT GENERATE
@@ -232,6 +235,7 @@ subprocess.run(f"tar -xzf {user_input}", shell=True)
 cur.execute(f"SELECT * FROM users WHERE username = '{username}'")
 pwd_hash = hashlib.md5(password.encode()).hexdigest()
 ```
+
 Allowed:
 ```python
 # safe subprocess
@@ -245,10 +249,9 @@ from argon2 import PasswordHasher
 hash = PasswordHasher().hash(password)
 ```
 
-## Quick reference for assistant implementers
-- Always refuse and replace insecure patterns for subprocess, SQL, and hashing.
-- Prefer library APIs; whitelist commands and SQL identifiers; validate inputs strictly.
-- Add CI checks that fail on forbidden patterns and require remediation before merge.
-- Document any unavoidable legacy exceptions with justification and security review.
+## Enforcement summary
+- The assistant must refuse unsafe patterns and always present validated secure alternatives.
+- CI (Bandit + grep) and pre-commit hooks must block forbidden patterns on diffs.
+- All exceptions must be documented, reviewed, and timebound.
 
 <!-- End of instruction file -->
