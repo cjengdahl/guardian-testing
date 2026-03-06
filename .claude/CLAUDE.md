@@ -1,15 +1,33 @@
 # AI Code Assistant — Secure Code Generation & Enforcement Instructions
 
+- Checklist (high-level revision plan)
+  - Forbid any use of shell=True, os.system/os.popen, or dynamic shell construction; require list-form subprocess with strict validation and command whitelists.
+  - Prohibit string-built SQL (f-strings, %-format, concatenation) for user data; require parameterized queries/ORMs and whitelist any dynamic identifiers.
+  - Forbid MD5/SHA1 for security-sensitive uses; require Argon2 (argon2-cffi) or justified fallback and strict legacy MD5 exception rules.
+  - Enforce the rules with CI (Bandit + grep), pre-commit hooks, and PR bot checks that fail PRs introducing forbidden patterns.
+  - Provide refusal behavior for insecure requests and secure, validated alternatives with error handling.
+
 ## Purpose
-Provide concise, enforceable rules so the AI Code Assistant never generates insecure code patterns (unsafe subprocess/shell usage, string-built SQL injection, and weak hashing like MD5/SHA1 for security). These rules are mandatory for any code produced by the assistant for this repository and are tuned to eliminate recurring vulnerabilities flagged by automated scanners.
+Concise, enforceable rules so the AI Code Assistant never generates insecure code patterns (unsafe subprocess/shell usage, string-built SQL, weak hashing) and to ensure automated scans and reviewers can reject PRs that introduce them.
 
 ## High-level policy (must be followed)
 - The assistant must never output code that:
-  - Invokes or constructs shell strings for execution (e.g., subprocess.run(..., shell=True), subprocess.Popen(..., shell=True), os.system(), os.popen()).
-  - Constructs SQL statements by f-strings, %-formatting, or string concatenation that include untrusted values.
+  - Executes shell strings (e.g., subprocess.run(..., shell=True), subprocess.Popen(..., shell=True), os.system(), os.popen()).
+  - Constructs SQL by interpolating untrusted values (f-strings, %-formatting, or concatenation).
   - Uses hashlib.md5(...) or hashlib.sha1(...) for authentication, password hashing, token signing, or HMAC.
-- If a user requests an insecure pattern, the assistant must refuse, explain briefly why it is insecure, and provide a secure, validated alternative with error handling.
-- Prefer library APIs (tarfile, shutil, GitPython, DB driver parameterization/ORMs, argon2-cffi) over shelling out.
+- If asked for an insecure pattern, refuse, explain briefly why, and provide a secure, validated alternative with robust error handling.
+- Prefer library APIs (tarfile, shutil, GitPython, DB driver parameterization/ORMs, argon2-cffi) to shelling out.
+
+## Assistant refusal and remediation behavior
+- When a user requests code containing any forbidden pattern the assistant must:
+  - Refuse to provide the insecure pattern.
+  - Provide a one-sentence explanation (e.g., "Using shell=True allows command injection from untrusted input.").
+  - Provide a secure alternative that includes:
+    - Strong input validation (types, lengths, allowed character set, canonicalization for paths).
+    - Server-side whitelisting where applicable (commands, table/column names).
+    - Proper error handling (catch exceptions, log sanitized diagnostics internally, return user-friendly messages).
+    - Short inline comments explaining security choices.
+- All provided alternatives must be production-ready for security review.
 
 ## Forbidden patterns (strict — do not generate)
 Do not generate any code containing:
@@ -27,20 +45,19 @@ cur.execute(f"SELECT * FROM users WHERE username = '{username}'")
 pwd_hash = hashlib.md5(password.encode()).hexdigest()
 ```
 
-## Subprocess & shell execution rules
-- Prefer built-in libraries/APIs. If an external command is required:
-  - Use sequence form and shell=False:
+## Subprocess & shell execution rules (addresses B404, B602)
+- Prefer built-in libraries. If an external process is required:
+  - Always use sequence form (list) and shell=False:
     subprocess.run([...], check=True, capture_output=True, text=True)
-  - Restrict executables to a server-side ALLOWED_COMMANDS whitelist.
-  - Validate executable existence with shutil.which().
-  - Rigorously validate every user-supplied argument:
-    - Types and maximum lengths
-    - Reject shell metacharacters (e.g., `;`, `&&`, `|`, `>`, `<`, backticks)
-    - Deny path-traversal (no "../") unless canonicalized and explicitly allowed
-    - Enforce a strict character whitelist via regex when appropriate
-  - Catch subprocess.CalledProcessError, log only sanitized diagnostics internally, and return a generic user-friendly error message.
-  - Do not expose raw stdout/stderr or stack traces to end users.
-  - Use least privilege. Avoid running commands as root; any escalation must be documented in the PR and narrowly scoped.
+  - Enforce a server-side ALLOWED_COMMANDS whitelist and use shutil.which() to verify existence.
+  - Validate every user-supplied argument:
+    - Type checks and maximum lengths.
+    - Deny path traversal (".." or leading "/") unless canonicalized and explicitly allowed.
+    - Reject shell metacharacters (e.g., ; && | > < ` $).
+    - Use a strict character whitelist regex when appropriate.
+  - Catch subprocess.CalledProcessError and other exceptions; log only sanitized diagnostics internally and return generic, user-friendly messages. Do not leak raw stdout/stderr or stack traces to users.
+  - Avoid running commands as root; any escalation must be documented in the PR and narrowly scoped.
+- Never generate code using shell=True, os.system, or os.popen. If code previously used shell=True, rewrite to list-form calls with validation and whitelisting.
 
 Safe subprocess example
 ```python
@@ -50,18 +67,18 @@ import re
 from typing import Sequence
 
 ALLOWED_COMMANDS = {"tar", "gzip", "jq"}
-_ALLOWED_FILENAME = re.compile(r"^[A-Za-z0-9._\-]+$")  # no spaces or shell metacharacters
+_ALLOWED_ARG = re.compile(r"^[A-Za-z0-9._\-]+$")  # no spaces or shell metacharacters
 
-def _validate_filename(name: str) -> str:
-    if not isinstance(name, str) or not name:
-        raise ValueError("filename must be a non-empty string")
-    if ".." in name or name.startswith("/tmp/unsafe"):
-        raise ValueError("disallowed filename")
-    if len(name) > 255:
-        raise ValueError("filename too long")
-    if not _ALLOWED_FILENAME.match(name):
-        raise ValueError("filename contains invalid characters")
-    return name
+def _validate_arg(arg: str) -> str:
+    if not isinstance(arg, str) or not arg:
+        raise ValueError("argument must be a non-empty string")
+    if ".." in arg or arg.startswith("/tmp/unsafe"):
+        raise ValueError("disallowed path or traversal")
+    if len(arg) > 255:
+        raise ValueError("argument too long")
+    if not _ALLOWED_ARG.match(arg):
+        raise ValueError("argument contains invalid characters")
+    return arg
 
 def run_command(args: Sequence[str]) -> str:
     if not isinstance(args, (list, tuple)) or not args:
@@ -71,24 +88,22 @@ def run_command(args: Sequence[str]) -> str:
         raise ValueError("command not permitted")
     if shutil.which(cmd) is None:
         raise FileNotFoundError(f"Command not found: {cmd}")
-    # Validate additional args explicitly
     for a in args[1:]:
-        _validate_filename(a)
+        _validate_arg(a)
     try:
         res = subprocess.run(list(args), check=True, capture_output=True, text=True)
-        # Return only sanitized output or structured data; avoid leaking internal errors
+        # Return sanitized output only (or structured data); avoid exposing raw error details
         return res.stdout
     except subprocess.CalledProcessError as e:
-        # Log sanitized details internally; do not include user input or raw stderr in responses
         # logger.error("external command failed: %s exit=%s", cmd, e.returncode)
         raise RuntimeError("external command failed") from e
 ```
 
-## SQL query construction rules
-- Always use parameterized DB-API queries or a vetted ORM. Forbidden: f-strings, %-formatting, + concatenation with user input.
-- If dynamic identifiers are required (table/column/ORDER BY), validate against a server-side whitelist before interpolation. Never accept client-provided identifiers without validation.
-- Validate types, ranges, and maximum lengths for numeric and string parameters.
-- Catch database exceptions and do not return SQL statements, parameter values, or stack traces to clients; log sanitized errors internally.
+## SQL query construction rules (addresses B608)
+- Always use parameterized DB-API queries or a vetted ORM. Forbidden: f-strings, %-formatting, or string concatenation to build SQL with user data.
+- If dynamic identifiers are required (table/column names or ORDER BY), validate them against a server-side whitelist before interpolation. Never accept client-provided identifiers without validation.
+- Validate all parameter types, ranges, and maximum lengths.
+- Catch database exceptions; do not return SQL statements, parameter values, or stack traces to clients; log sanitized errors internally.
 
 Safe SQL examples
 ```python
@@ -111,21 +126,22 @@ ALLOWED_SORT_COLS = {"id", "email", "created_at"}
 def fetch_sorted(conn: sqlite3.Connection, sort_col: str):
     if sort_col not in ALLOWED_SORT_COLS:
         raise ValueError("invalid sort column")
-    query = f"SELECT id, email FROM users ORDER BY {sort_col} DESC"  # safe because of whitelist
+    query = f"SELECT id, email FROM users ORDER BY {sort_col} DESC"  # safe because sort_col is whitelisted
     cur = conn.cursor()
     cur.execute(query)
     return cur.fetchall()
 ```
 
-## Hashing and password storage rules
+## Hashing and password storage rules (addresses B324)
 - Forbidden: MD5 or SHA1 for password hashing, token signing, HMAC, or any security-sensitive function.
-- Required: use Argon2 (argon2-cffi) or passlib wrappers. Acceptable fallback: bcrypt or scrypt only if Argon2 is unavailable (document justification in PR).
-- Use SHA-256 (or better) for non-security integrity or checksums.
-- Legacy MD5 allowed only when ALL of the following are true:
-  - Use hashlib.md5(..., usedforsecurity=False) (Python 3.9+) is explicitly called.
-  - Inline code comment documents the non-security-only purpose.
-  - The PR description contains a business justification and a link to an approved entry in SECURITY_EXCEPTIONS.md.
-  - A security review approval is recorded in the exceptions registry.
+- Required: use Argon2 (argon2-cffi) or passlib wrappers. Acceptable fallback only with documented justification: bcrypt or scrypt (documented in PR).
+- Use SHA-256 or better for non-security integrity or checksums.
+- Legacy MD5 allowed only when ALL the following are satisfied:
+  - Code uses hashlib.md5(..., usedforsecurity=False) (Python 3.9+).
+  - Inline code comment documents the non-security-only purpose and references SECURITY_EXCEPTIONS.md.
+  - The PR description contains a business justification and link to an approved entry in SECURITY_EXCEPTIONS.md.
+  - A security review approval is recorded in SECURITY_EXCEPTIONS.md.
+- The assistant must refuse any MD5/SHA1 usage for security purposes and provide an Argon2-based alternative.
 
 Password hashing example (argon2-cffi)
 ```python
@@ -166,20 +182,20 @@ def md5_dedup(data: bytes) -> str:
     return hashlib.md5(data, usedforsecurity=False).hexdigest()
 ```
 
-## Assistant refusal and remediation behavior
-- If the user requests code containing any forbidden pattern, the assistant must:
-  - Refuse to provide that insecure pattern.
-  - Explain in one sentence why it is insecure (e.g., "Using shell=True allows command injection from untrusted input.").
-  - Provide a secure alternative that includes:
-    - Strong input validation (types, lengths, allowed characters, path canonicalization).
-    - Server-side whitelisting where applicable (commands, SQL identifiers).
-    - Proper error handling (catch exceptions, log sanitized diagnostics, return user-friendly messages).
-    - Short code comments explaining the security choices.
-- All generated examples must be production-ready for security review (not toy-only).
+## Assistant generation constraints (enforced for every response that could include code)
+- The assistant must scan its proposed code for forbidden constructs before returning it. If any forbidden construct is present, the assistant must refuse and return a secure alternative.
+- All generated code must include:
+  - Validation of all external inputs (types, maximum length, allowed characters).
+  - Explicit server-side whitelists for commands and dynamic DB identifiers.
+  - Exception handling that sanitizes logs and returns user-friendly errors.
+- Examples must be realistic and ready for review (with comments and error handling).
 
-## CI & automated enforcement
-- Add a GitHub Actions security job that runs Bandit and rejects diffs that introduce forbidden patterns. The job must fail the build if forbidden patterns are detected anywhere in the PR diff.
-- The job must also run a grep-based detection that scans changed files for forbidden constructs including shell=True, subprocess.*shell=, os.system, os.popen, f-string SQL patterns, string concatenation used to build SQL, and hashlib.md5/hashlib.sha1. It should require usedforsecurity=False and an exceptions registry for MD5 usage.
+## CI & automated enforcement (Bandit + grep; fail PRs introducing forbidden patterns)
+- Add a GitHub Actions job named "security" that:
+  - Runs Bandit.
+  - Fetches changed files in the PR/commit range and scans only changed files for forbidden constructs via grep.
+  - Fails the job (and thus the PR) if any forbidden patterns are detected.
+  - Enforces MD5 exceptions: if hashlib.md5 appears in changed files, the CI requires (a) presence of usedforsecurity=False in the same file, (b) an inline comment referencing SECURITY_EXCEPTIONS.md, and (c) an approved entry in SECURITY_EXCEPTIONS.md; otherwise fail.
 - Example GitHub Actions job:
 ```yaml
 name: Security Scan
@@ -197,36 +213,56 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install bandit
-      - name: Run bandit
+      - name: Run bandit (report only)
         run: bandit -r . -ll -f json -o bandit-output.json || true
       - name: Fail on forbidden patterns in diff
+        shell: bash
         run: |
           set -euo pipefail
-          # Only inspect changed files in the PR/commit range
-          git fetch --no-tags --depth=1 origin +refs/heads/*:refs/remotes/origin/*
-          CHANGED_FILES=$(git diff --name-only HEAD origin/HEAD || git diff --name-only HEAD~1)
+          # Determine changed files for the PR/commit
+          git fetch --no-tags --depth=1 origin +refs/heads/*:refs/remotes/origin/* || true
+          CHANGED_FILES=$(git diff --name-only HEAD origin/HEAD || git diff --name-only HEAD~1 || true)
           if [ -z "$CHANGED_FILES" ]; then
             echo "No changed files detected"; exit 0
           fi
-          echo "$CHANGED_FILES" | xargs git --no-pager grep -n --line-number -E \
-            "shell=True|subprocess\\.[A-Za-z_]+\\(.*shell=|\\bos\\.system\\(|\\bos\\.popen\\(|f\".*SELECT|f'.*SELECT|\\+\\s*\".*SELECT|\\bhashlib\\.md5\\b|\\bhashlib\\.sha1\\b" -- ':!venv/*' || true
-          # If any matches found exit with message
-          if git --no-pager grep -n --line-number -E "shell=True|subprocess\\.[A-Za-z_]+\\(.*shell=|\\bos\\.system\\(|\\bos\\.popen\\(|f\".*SELECT|f'.*SELECT|\\+\\s*\".*SELECT|\\bhashlib\\.md5\\b|\\bhashlib\\.sha1\\b" $CHANGED_FILES -- ':!venv/*' ; then
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+          # Forbidden pattern list (covers shell usage, SQL string building, and weak hashes)
+          PATTERN='shell=True|subprocess\.[A-Za-z_]+\(.*shell=|\\bos\.system\(|\\bos\.popen\(|f"[^"]*SELECT|f'\"\"'[^']*SELECT|(\+|\%)-format.*SELECT|\bhashlib\.md5\b|\bhashlib\.sha1\b'
+          # Check changed files for forbidden patterns (exclude venv)
+          if git --no-pager grep -n -E "$PATTERN" $CHANGED_FILES -- ':!venv/*' ; then
             echo "Forbidden security patterns detected in changed files. See repository security policy for remediation." >&2
             exit 1
           fi
+          # Special MD5 exception enforcement: if hashlib.md5 seen, require usedforsecurity=False and inline reference
+          MD5_FILES=$(git --no-pager grep -l -E "\bhashlib\.md5\b" $CHANGED_FILES -- ':!venv/*' || true)
+          if [ -n "$MD5_FILES" ]; then
+            while read -r f; do
+              echo "MD5 usage found in $f; enforcing exception requirements."
+              # require usedforsecurity=False in the same file
+              if ! grep -n "usedforsecurity=False" "$f" >/dev/null 2>&1; then
+                echo "hashlib.md5 used without usedforsecurity=False in $f" >&2
+                exit 1
+              fi
+              # require inline comment referencing SECURITY_EXCEPTIONS.md
+              if ! grep -n "SECURITY_EXCEPTIONS.md" "$f" >/dev/null 2>&1; then
+                echo "hashlib.md5 used without inline SECURITY_EXCEPTIONS.md reference in $f" >&2
+                exit 1
+              fi
+            done <<< "$MD5_FILES"
+            # require repository SECURITY_EXCEPTIONS.md contains an approval entry (simple existence check)
+            if ! grep -q "MD5" SECURITY_EXCEPTIONS.md >/dev/null 2>&1; then
+              echo "MD5 usage detected in diff but SECURITY_EXCEPTIONS.md lacks an approval entry." >&2
+              exit 1
+            fi
+          fi
 ```
-- CI must:
-  - Fail the PR if forbidden patterns are introduced in the diff.
-  - Provide actionable remediation messages linking to secure examples in this document.
-  - Enforce MD5 exceptions: if hashlib.md5 is detected, CI should require a matching SECURITY_EXCEPTIONS.md entry and the inline code comment reference; otherwise fail.
 
 ## Pre-commit hooks & PR bot
 - Add pre-commit hooks to run:
   - bandit
-  - the same grep detection used in CI
-- Configure a PR bot to scan diffs and post inline comments for any forbidden patterns and block merging until resolved.
-- Pre-commit configuration snippet (example .pre-commit-config.yaml):
+  - the same grep detection used in CI (operates on staged files)
+- Example .pre-commit-config.yaml:
 ```yaml
 repos:
   - repo: local
@@ -237,25 +273,26 @@ repos:
         language: system
       - id: forbidden-patterns
         name: forbidden-patterns
-        entry: grep -n --line-number -E "shell=True|subprocess\\.[A-Za-z_]+\\(.*shell=|\\bos\\.system\\(|\\bos\\.popen\\(|f\".*SELECT|f'.*SELECT|\\+\\s*\".*SELECT|\\bhashlib\\.md5\\b|\\bhashlib\\.sha1\\b" -- ':!venv/*'
+        entry: grep -n --line-number -E "shell=True|subprocess\\.[A-Za-z_]+\\(.*shell=|\\bos\\.system\\(|\\bos\\.popen\\(|f\"[^\"']*SELECT|\\+\\s*\"[^\"']*SELECT|\\bhashlib\\.md5\\b|\\bhashlib\\.sha1\\b" -- ':!venv/*'
         language: system
         pass_filenames: false
 ```
+- Configure a PR bot (or GitHub Checks) to scan diffs and post inline comments for any forbidden patterns and block merging until resolved.
 
 ## Minimal PR reviewer checklist (apply to AI-generated PRs)
 - No use of shell=True, subprocess.* with shell=True, os.system(), or os.popen() on modified lines.
-- All subprocess invocations use list arguments, shutil.which checks, whitelists, and explicit validation.
-- No SQL constructed via f-strings/concatenation with user input; parameterized queries or ORM used. Any interpolated identifier validated with a server-side whitelist.
-- No hashlib.md5 or hashlib.sha1 used for security-sensitive purposes. If MD5 appears, confirm usedforsecurity=False, inline justification, and an approved SECURITY_EXCEPTIONS.md entry.
+- All subprocess invocations use list arguments, shutil.which checks, server-side whitelists, and explicit validation of each argument.
+- No SQL constructed via f-strings/concatenation with user input; parameterized queries or vetted ORM used. Any interpolated identifier validated against a server-side whitelist.
+- No hashlib.md5 or hashlib.sha1 used for security-sensitive purposes. If MD5 appears, confirm usedforsecurity=False, inline justification including SECURITY_EXCEPTIONS.md reference, and an approved entry in SECURITY_EXCEPTIONS.md.
 - CI security job and pre-commit hooks pass for the PR diff.
 
 ## Exceptions & maintenance
-- Exceptions (e.g., legacy MD5) allowed only with:
-  - Inline code comment documenting non-security-only use and link to SECURITY_EXCEPTIONS.md.
+- MD5 exceptions (legacy, non-security) require:
+  - Inline code comment documenting non-security-only purpose and referencing SECURITY_EXCEPTIONS.md.
   - Use of hashlib.md5(..., usedforsecurity=False).
-  - Business justification in the PR description.
-  - Explicit security review and recorded approval in SECURITY_EXCEPTIONS.md.
-- Update this instruction file whenever new scan patterns or vulnerabilities appear and adjust CI/grep rules accordingly.
+  - Business justification and a link to an approved entry in SECURITY_EXCEPTIONS.md in the PR description.
+  - Explicit security review approval recorded in SECURITY_EXCEPTIONS.md.
+- Update this document whenever new scan patterns or vulnerabilities appear; adjust CI/grep rules accordingly.
 
 ## Quick reference — forbidden vs allowed
 Forbidden:
@@ -280,7 +317,7 @@ hash = PasswordHasher().hash(password)
 ```
 
 ## Enforcement summary
-- The assistant must refuse unsafe patterns and always present validated secure alternatives.
-- CI (Bandit + grep) and pre-commit hooks must block forbidden patterns on diffs.
-- All MD5 exceptions require explicit review and documentation in SECURITY_EXCEPTIONS.md and must use usedforsecurity=False.
+- The assistant must refuse unsafe patterns and always present validated secure alternatives with input validation, whitelists, and error handling.
+- CI (Bandit + grep) and pre-commit hooks will block forbidden patterns introduced in diffs.
+- All MD5 exceptions require usedforsecurity=False, an inline justification referencing SECURITY_EXCEPTIONS.md, and an approved entry in that file.
 - Security reviews and PR checklist items are mandatory for any exception or deviation.
