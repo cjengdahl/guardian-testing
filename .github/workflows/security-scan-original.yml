@@ -41,7 +41,7 @@ jobs:
 
       - name: Process with Guardian
         if: steps.changed-files.outputs.files != ''
-        uses: SecurityJourney/guardian-action@v1
+        uses: SecurityJourney/guardian-action@v1.2.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
