@@ -1,0 +1,54 @@
+name: Security Scan with Guardian
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.x"
+
+      - name: Install Bandit
+        run: pip install bandit
+
+      - name: Get changed Python files
+        id: changed-files
+        run: |
+          FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- '*.py' | tr '\n' ' ')
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+
+      - name: Run Bandit scan
+        if: steps.changed-files.outputs.files != ''
+        run: |
+          bandit -f json -o scan-results.json ${{ steps.changed-files.outputs.files }} || true
+
+      - name: Process with Guardian
+        if: steps.changed-files.outputs.files != ''
+        uses: SecurityJourney/guardian-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          scan_results_path: scan-results.json
+          instruction_file_path: .claude/CLAUDE.md
+          scanner_type: bandit
+          api_domain: my.securityjourney.dev
+          api_token: ${{ secrets.GUARDIAN_API_TOKEN }}
+          auto_commit: true
+          send_git_metadata: true
