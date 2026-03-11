@@ -2,7 +2,6 @@ import hashlib
 import sqlite3
 import subprocess
 
-# trigger
 
 
 def get_user(username):
