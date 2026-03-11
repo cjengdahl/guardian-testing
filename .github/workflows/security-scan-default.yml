@@ -1,10 +1,10 @@
-name: Security Scan with Guardian - original
+name: Security Scan with Guardian - cwes default
 
 on:
   pull_request:
     types: [opened, synchronize]
     branches:
-      - original
+      - default
 
 permissions:
   contents: write
@@ -43,7 +43,7 @@ jobs:
 
       - name: Process with Guardian
         if: steps.changed-files.outputs.files != ''
-        uses: SecurityJourney/guardian-action@v1.2.1
+        uses: SecurityJourney/guardian-action@git_metadata
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:

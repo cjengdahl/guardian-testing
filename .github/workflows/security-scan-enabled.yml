@@ -1,8 +1,10 @@
-name: Security Scan with Guardian
+name: Security Scan with Guardian - cwes enabled
 
 on:
   pull_request:
     types: [opened, synchronize]
+    branches:
+      - enabled
 
 permissions:
   contents: write
