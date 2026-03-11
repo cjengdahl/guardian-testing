@@ -50,6 +50,5 @@ jobs:
           scan_results_path: scan-results.json
           instruction_file_path: .claude/CLAUDE.md
           scanner_type: bandit
-          api_domain: my.securityjourney.dev
           api_token: ${{ secrets.GUARDIAN_API_TOKEN }}
           auto_commit: true
