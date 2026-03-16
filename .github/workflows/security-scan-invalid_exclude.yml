@@ -47,6 +47,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          api_domain: my.securityjourney.dev
           scan_results_path: scan-results.json
           instruction_file_path: .claude/CLAUDE.md
           scanner_type: bandit
