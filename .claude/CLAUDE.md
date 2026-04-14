@@ -1,203 +1,167 @@
-# AI Code Assistant Security & Coding Guidelines (Revised)
+# AI Code Assistant Security & Code-Generation Instructions
 
-Revision checklist (high-level)
-- Eliminate hardcoded secrets and enforce secret-management patterns (env vars, secret managers, detect-secrets).
-- Enforce explicit network timeouts and TLS verification for all HTTP clients.
-- Prohibit insecure deserialization, insecure hashing (MD5/SHA1), eval/exec, shell=True, and SQL via string interpolation; provide secure alternatives.
-- Ensure Flask defaults to debug OFF and safe error handling/session settings.
-- Add CI + pre-commit enforcement to detect banned patterns (bandit, semgrep, detect-secrets, pip-audit/safety) and fail builds on findings.
-- Require monthly rule-review and automated checks to prevent future regressions.
+- Revision checklist (high-level)
+  - Remove hardcoded secrets; require env/secret-manager usage and detect-secrets in pre-commit/CI.
+  - Enforce network timeouts and TLS verification on all HTTP clients.
+  - Forbid unsafe deserialization, insecure hashing (MD5/SHA1), eval/exec, and subprocess shell=True; provide secure alternatives.
+  - Ensure SQL parameterization/ORM usage only; forbid f-string/concatenated SQL.
+  - Default Flask debug OFF, secure session settings, and hide stack traces.
+  - Add CI + pre-commit enforcement (bandit, semgrep, detect-secrets, pip-audit) and fail builds on findings.
 
 ## Purpose
-These concise, mandatory instructions govern code produced by the AI Code Assistant tool to prevent the class of vulnerabilities identified by recent scans (hardcoded secrets, request without timeout, insecure hashing/deserialization, SQL injection, enabling Flask debug, shell injection, etc.). All rules are binding for generated code and must be enforced in CI and pre-commit tooling.
+These instructions are mandatory for the AI Code Assistant tool. They ensure generated code will not reproduce the vulnerabilities detected by recent scans (hardcoded secrets, missing timeouts, unsafe deserialization, insecure hashing, SQL injection, Flask debug enabled, shell injection risks, etc.). All generated code must adhere to these rules and the CI/pre-commit checks described below.
 
-## Principles (applies to generated code)
-- Fail-safe defaults: deny dangerous actions by default (no shell execution, no unsafe deserialization, no debug-on).
-- Prefer secure, well-maintained libraries and primitives (requests/aiohttp with timeouts, passlib/argon2, SQLAlchemy/parameterized DB APIs).
-- Always use explicit parameterization for external-facing operations (SQL, shell, HTTP).
-- Avoid logging secrets or PII in plaintext; mask/redact if necessary.
-- Provide concise comments where a security decision is intentionally made.
+## Principles (short)
+- Fail-safe defaults: deny dangerous actions by default (no shell execution, no unsafe deserialization, debug OFF).
+- Use well-maintained libraries and explicit secure primitives.
+- Always prefer parameterization, explicit validation/whitelisting, and secret management.
+- Avoid logging secrets/PII; redact before logging.
+- Provide a concise inline comment when an alternate, less secure approach is intentionally requested (must include documented approval and risk acceptance).
 
 ## Secrets and Configuration
-- NEVER hardcode secrets, credentials, API keys, or passwords in source code, tests, examples or CI files.
-- Always read secrets from environment variables or a secrets manager. Use explicit comments and placeholders in generated code:
+- NEVER hardcode secrets, credentials, API keys, or passwords in source, tests, examples, or CI.
+- Read secrets from environment variables or a secret manager. Use explicit TODO comments for wiring:
 ```python
-# Do NOT hardcode. Fetch from environment or secret manager (Vault, AWS Secrets Manager, etc.).
-# Example: DB_PASSWORD = os.environ["MY_SERVICE_DB_PASSWORD"]
+# Do NOT hardcode. Fetch from env or a secret manager (Vault, AWS Secrets Manager, etc.).
 DB_PASSWORD = os.environ.get("MY_SERVICE_DB_PASSWORD")  # TODO: wire to secret manager
 ```
-- Tests: use secure test-config fixtures, mocks, or secrets injected by CI; never commit plaintext test secrets.
-- Add detect-secrets to pre-commit and CI. Example .pre-commit-config.yaml snippet:
-```yaml
-repos:
-  - repo: https://github.com/Yelp/detect-secrets
-    rev: v1.1.0
-    hooks:
-      - id: detect-secrets
-```
+- Tests must use mocks, fixtures, or CI-injected secrets (do not commit plaintext test secrets).
+- Add detect-secrets to pre-commit and CI.
 
 ## HTTP Clients and Network Calls
-- ALWAYS include explicit timeouts and enforce TLS verification on network calls. Provide a configurable default and allow overrides:
+- ALWAYS include explicit timeouts and TLS verification; provide a configurable default:
 ```python
 import requests
 DEFAULT_TIMEOUT = 5  # seconds
 
 def get_json(url: str, timeout: float = DEFAULT_TIMEOUT):
-    resp = requests.get(url, timeout=timeout)  # timeout enforced
+    # explicit timeout prevents hung requests; do not set verify=False in production.
+    resp = requests.get(url, timeout=timeout)
     resp.raise_for_status()
     return resp.json()
 ```
-- DO NOT set verify=False. If connecting to internal certs, document how to provide CA bundles via env vars or config.
-- For async clients (aiohttp) include both connect and read timeouts:
+- For aiohttp:
 ```python
 import aiohttp
 from aiohttp import ClientTimeout
 
 DEFAULT_TIMEOUT = ClientTimeout(total=10)
-
 async def fetch(session: aiohttp.ClientSession, url: str, timeout: ClientTimeout = DEFAULT_TIMEOUT):
     async with session.get(url, timeout=timeout) as resp:
         resp.raise_for_status()
         return await resp.text()
 ```
-- For streaming/long-polling add cancellation logic and smaller read/conn timeouts.
+- DO NOT use verify=False. Document how to use a custom CA bundle via env var (e.g., REQUESTS_CA_BUNDLE).
 
 ## Cryptography and Hashing
-- DO NOT use MD5 or SHA1 for security-sensitive purposes (passwords, signatures, token generation). For non-security hashing (cache keys, deduplication) prefer SHA-256 and document the use.
-- For password storage and verification use dedicated libraries (passlib, bcrypt, argon2). Example:
+- DO NOT use MD5 or SHA1 for security-sensitive purposes (passwords, signatures, tokens).
+- Use passlib / argon2 / bcrypt for password hashing:
 ```python
 from passlib.context import CryptContext
-
 pwd_ctx = CryptContext(schemes=["argon2"], deprecated="auto")
 
 def hash_password(password: str) -> str:
-    # Argon2 is chosen for strong password hashing with memory hardness.
+    # Argon2 provides memory-hard password hashing.
     return pwd_ctx.hash(password)
 
 def verify_password(password: str, hashed: str) -> bool:
     return pwd_ctx.verify(password, hashed)
 ```
-- For HMAC use the stdlib hmac with SHA-256 or better:
+- For HMAC and non-password crypto use stdlib with SHA-256 or better:
 ```python
-import hmac
-import hashlib
-
+import hmac, hashlib
 def compute_hmac(key: bytes, msg: bytes) -> str:
     return hmac.new(key, msg, hashlib.sha256).hexdigest()
 ```
-- Prohibit use of hashlib.md5() or hashlib.sha1() for authentication; if present in scans flag for manual review and replacement with hashlib.sha256 or Argon2 depending on use-case.
+- If non-security sha256-based digests are used for caching, document rationale.
 
 ## SQL and Database Access
-- NEVER construct SQL queries via string concatenation, f-strings, or .format() with user input.
-- Use parameterized queries or ORM APIs. Examples:
+- NEVER construct SQL via string concatenation, f-strings, or .format() with user input.
+- Use parameterized queries or ORM:
 ```python
-# psycopg2
+# psycopg2 example
 cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-
-# sqlite3
-cursor.execute("INSERT INTO users (name, email) VALUES (?, ?)", (name, email))
-
-# SQLAlchemy (ORM)
+# SQLAlchemy example
 session.query(User).filter(User.id == user_id).one()
 ```
-- Do not commit database credentials. Read DB connection strings via env vars or secret managers.
-- For dynamic queries use libraries' parameter binding APIs; never inject user input into SQL fragments without strict validation and whitelisting.
+- For dynamic SQL fragments, use query builders, explicit validation, and whitelisting. Always validate/whitelist column names and other identifiers before interpolation.
+- Do not commit DB credentials; read from env/secret manager.
 
 ## YAML and Deserialization
 - DO NOT use yaml.load() on untrusted input. Use yaml.safe_load() or json.loads():
 ```python
 import yaml
-
 with open("config.yaml") as f:
-    cfg = yaml.safe_load(f)  # safe_load avoids arbitrary object instantiation
+    cfg = yaml.safe_load(f)
 ```
-- DO NOT use pickle, marshal, or eval on untrusted input. If object deserialization is required, implement whitelist-based deserializers and document supported types explicitly.
-- For complex formats (protobufs, JSON schema) prefer schema validation libraries and explicit parsing.
+- DO NOT use pickle, marshal, eval, exec, or any unsafe deserialization on untrusted input.
+- If structured deserialization is required, require schema validation (e.g., jsonschema, pydantic) and whitelist allowed types. Document supported types.
 
-## Prohibited / Blacklisted Patterns (do not generate)
-The AI must not generate code containing these patterns. When flagged, the AI must automatically replace with secure alternatives or require explicit developer-approved exceptions with a documented security rationale.
-
-- Hardcoded secrets (passwords, API keys, tokens)
-  - Forbidden pattern example: password = "secret"
-  - Alternative: read from env or secret manager (see "Secrets and Configuration").
-- yaml.load(...) without loader or safe_load
-  - Forbidden; replace with yaml.safe_load or explicit loader.
-- pickle.loads(), pickle.load(), or any unsafe deserialization on untrusted input
-  - Forbidden; replace with safe alternatives or whitelist-based deserializers.
-- eval(...), exec(...), compile(..., 'eval') on untrusted input
-  - Forbidden; prefer safe parsers or restricted sandboxes.
-- hashlib.md5(...) or hashlib.sha1(...) used for authentication/passwords
-  - Forbidden for security uses; replace with passlib/argon2 or hashlib.sha256 for non-sensitive purposes.
-- subprocess.run(..., shell=True), os.system(...), popen with shell construction using untrusted input
-  - Forbidden unless there is a vetted, logged justification. Use subprocess.run(list_of_args, shell=False) instead and sanitize inputs.
-- SQL via f-strings or concatenation
-  - Forbidden; use parameterized queries or ORM APIs.
-- requests.* calls without timeout or with verify=False
-  - Forbidden; always include timeouts and verify by default.
-- app.run(debug=True) or FLASK_DEBUG enabled by default in generated code
-  - Forbidden in examples intended for production; always default to OFF and read from env in development.
-- Any code that programmatically disables TLS certificate validation
-  - Forbidden.
-- Logging secrets/PII in plaintext (including returning stack traces to clients)
-  - Forbidden; redact/mask sensitive fields.
-
-For every prohibited pattern above, the AI must generate the secure alternative inline (see examples elsewhere in this file).
+## Command Execution and Shell Safety
+- Avoid generating code that executes arbitrary shell commands. When necessary:
+  - Use subprocess.run with a list and shell=False:
+```python
+import subprocess
+subprocess.run(["/usr/bin/convert", input_file, output_file], check=True)
+```
+  - Validate and whitelist user-provided command arguments.
+  - Disallow shell=True in generated code unless an approved, logged security exception is recorded in the PR with mitigation steps.
 
 ## Flask and Web Application Settings
-- Default to debug OFF and enable only via explicit environment configuration for development:
+- Default to debug OFF and enable only via explicit environment configuration:
 ```python
 import os
 from flask import Flask
-
 app = Flask(__name__)
-app.debug = os.environ.get("FLASK_DEBUG", "False").lower() in ("1", "true")
-# Secure session and cookie defaults for production:
+app.debug = os.environ.get("FLASK_DEBUG", "False").lower() in ("1","true")
 app.config.update(
+    SECRET_KEY=os.environ.get("FLASK_SECRET_KEY"),  # must be set in production
     SESSION_COOKIE_SECURE=True,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
 )
-# Never include app.run(debug=True) in production examples.
 ```
-- Do not return stack traces or internal errors to clients. Use error handlers and log detailed traces server-side with masking of sensitive fields.
-- Use strong secret keys from env/secret manager:
-```python
-app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET_KEY")  # must be set in production
-```
+- Do not include app.run(debug=True) in production examples.
+- Do not return stack traces to clients; register error handlers and log detailed traces in server logs after redaction.
+- Ensure secret keys come from env/secret manager.
 
-## Command Execution and Shell
-- Avoid generating code that executes arbitrary shell commands. When required:
-  - Use subprocess with argument lists and shell=False:
-  ```python
-  import subprocess
-  subprocess.run(["ls", "-la", "/tmp"], check=True)
-  ```
-  - Validate and whitelist any user-provided portions of commands.
-  - Log command execution (not secrets) and handle errors.
-
-## Logging, Telemetry, and Error Messages
-- Never log secrets, credentials, or PII in plaintext. Implement a redact utility:
+## Logging and Telemetry
+- Never log secrets or PII in plaintext. Provide a small redact utility in generated code:
 ```python
-def redact_secret(value: str) -> str:
+def redact_secret(value: str, visible: int = 4) -> str:
     if not value:
         return value
-    return value[:4] + "***"  # simple example; prefer structured filters in real projects
+    if len(value) <= visible:
+        return "***"
+    return value[:visible] + "***"
 ```
-- Use structured logging and configurable scrubbing of sensitive fields before emission.
-- Limit error messages returned to clients; keep detailed traces in server logs only.
+- Prefer structured logging and configurable scrubbing filters.
 
-## Dependency and Version Guidance
-- Prefer well-maintained libraries, current stable versions and avoid deprecated algorithms.
-- Pin critical dependencies in lockfiles (pip-tools/poetry/Pipfile.lock).
-- Recommend periodic SCA and vulnerability scanning (Dependabot, OSV, pip-audit/safety).
+## Prohibited / Blacklisted Patterns
+The AI must never generate code containing these patterns. If a requested snippet would require such behavior, the AI must (1) refuse or (2) generate a secure alternative and require an explicit, documented exception with owner and mitigation.
+
+Forbidden patterns (automatic rewrite required):
+- Hardcoded secrets (e.g., password = "secret"). Replacement: env var or secret manager.
+- yaml.load(...) without safe loader. Replacement: yaml.safe_load().
+- pickle.load(s)/pickle.loads() on untrusted input. Replacement: json/protobuf/pydantic with validation.
+- eval(...)/exec(...)/compile(..., 'eval') on untrusted input. Replacement: safe parsers or limited DSL with whitelist.
+- hashlib.md5(...) or hashlib.sha1(...) for authentication or password hashing. Replacement: passlib/argon2 or hashlib.sha256 for non-sensitive use.
+- subprocess.run(..., shell=True), os.system(), or popen with shell-concatenation of untrusted input. Replacement: subprocess.run(list, shell=False) + validation.
+- SQL constructed by f-strings or string concatenation. Replacement: parameterized queries/ORM.
+- requests.* calls without timeout or with verify=False. Replacement: include timeout and respect TLS.
+- app.run(debug=True) in production examples.
+- Programmatic disabling of TLS validation.
+
+Every generated file must include a short inline comment when a prohibition was explicitly applied and why.
 
 ## CI / Automation Checks (required)
-- CI must run static and dynamic security checks and fail on findings of banned patterns:
-  - bandit (Python security checks)
-  - semgrep (detect banned patterns like yaml.load, pickle, hashlib.md5/sha1, requests without timeout, app.run(debug=True), subprocess shell=True, SQL f-strings)
-  - detect-secrets (pre-commit + CI)
-  - pip-audit or safety for dependency vulnerabilities
-- Example GitHub Actions workflow (minimal):
+CI must run these security checks and FAIL the build on any findings related to prohibited patterns:
+- bandit
+- semgrep (with project rules below)
+- detect-secrets (pre-commit + CI)
+- pip-audit or safety
+
+Minimal GitHub Actions job (fail on findings):
 ```yaml
 name: Security Checks
 on: [push, pull_request]
@@ -212,28 +176,31 @@ jobs:
           python-version: "3.10"
       - name: Install tools
         run: pip install bandit semgrep detect-secrets pip-audit
+      - name: Detect secrets
+        run: detect-secrets scan || true
       - name: Bandit scan
         run: bandit -r .
       - name: Semgrep scan
         run: semgrep --config p/ci .
-      - name: Detect secrets
-        run: detect-secrets scan > .secrets.baseline || true
       - name: Dependency audit
-        run: pip-audit || true
+        run: pip-audit
 ```
-- Add semgrep rules to catch these banned patterns (examples):
-  - yaml.load(
-  - pickle.load(
-  - hashlib.md5(
-  - hashlib.sha1(
-  - requests.get(    # without timeout param
-  - app.run(debug=True)
-  - subprocess.run(..., shell=True)
-  - f"SELECT .*{user_input}.*"  (pattern to catch SQL string formatting)
-- CI must be configured to FAIL the build on any findings related to the prohibited patterns above.
+- The CI must be configured to return a non-zero exit code on semgrep/bandit findings relevant to prohibited patterns.
+
+Semgrep rules (examples) — include these in repo at .github/semgrep/p/ci or as referenced config:
+- Disallow yaml.load without loader.
+- Disallow pickle.load(s)/pickle.loads().
+- Disallow hashlib.md5 and hashlib.sha1.
+- Detect requests.get/post without timeout argument.
+- Detect subprocess.run(..., shell=True).
+- Detect app.run(debug=True).
+- Detect SQL with f-strings or string concatenation patterns.
+- Detect obvious hardcoded secrets via regex (API_KEY|PASSWORD|SECRET) with low-FP tuning.
+
+Provide baseline suppression only for carefully reviewed, documented exceptions.
 
 ## Pre-commit and Repo Hygiene
-- Enforce pre-commit with detect-secrets, black/flake8, and a dedicated semgrep hook:
+- Enforce pre-commit with detect-secrets, black, flake8, and semgrep:
 ```yaml
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -244,37 +211,41 @@ repos:
     rev: v1.1.0
     hooks:
       - id: detect-secrets
-  - repo: https://github.com/returntocorp/semgrep
+  - repo: https://github.com/psf/black
+    rev: stable
+    hooks:
+      - id: black
+  - repo: https://github.com/pre-commit/mirrors-semgrep
     rev: v1.29.0
     hooks:
       - id: semgrep
-        args: ["--config", "p/ci"]
+        args: ["--config", ".github/semgrep/p/ci"]
 ```
+- Maintain a detect-secrets baseline in the repo (reviewed and rotated when new secrets are added via approved process).
 
 ## Safe Code-Generation Rules for the AI Tool
 When producing code, the AI must:
-1. Never output literal secrets. Use environment variables or placeholders with explicit instructions on secret source.
-2. Enforce secure defaults: include timeouts for network calls, verify TLS, safe deserialization, parameterized DB access, strong password hashing (Argon2), and debug OFF for web apps.
-3. Replace prohibited patterns automatically with secure alternatives. If a user requests legacy/insecure behavior, require an explicit warning, documented acceptance of risk, and generate a secure alternative first.
-4. Add concise inline comments explaining security decisions (e.g., why argon2 chosen).
-5. Provide short usage examples showing correct error handling, timeouts, and parameterized queries for any generated helper utilities.
-6. For any generated CI or automation, include semgrep rules and detect-secrets baseline to prevent regressions.
+1. Never output literal secrets. Use env variables or placeholders and include a TODO comment linking to secret manager instructions.
+2. Enforce secure defaults: include timeouts, TLS verification, safe deserialization, parameterized DB access, Argon2 for passwords, debug OFF.
+3. Automatically replace prohibited patterns with secure alternatives. If a user explicitly requests legacy/insecure behavior, require a documented security exception (owner, risk, mitigation) and present the secure alternative first.
+4. Add concise inline comments explaining security choices.
+5. Provide short usage examples showing correct error handling, timeouts, and parameterized queries for any helper utilities generated.
+6. For generated CI/automation, include semgrep rules and detect-secrets baseline to prevent regressions.
 
 ## Developer and Reviewer Checklist (must be completed before merge)
-- No hardcoded secrets or passwords present anywhere in code or tests.
-- All HTTP calls include timeouts and TLS verification.
-- No use of unsafe deserialization (yaml.load without loader, pickle on untrusted input).
+- No hardcoded secrets or passwords in code, tests, examples, or CI.
+- All HTTP calls include timeouts and enforce TLS.
+- No unsafe deserialization (yaml.load without loader, pickle, eval).
 - No MD5/SHA1 usage for authentication or password hashing.
-- All SQL statements are parameterized or use an ORM safely; no f-string SQL.
+- All SQL statements are parameterized or use an ORM safely.
 - Flask apps do not enable debug in production and do not return stack traces to clients.
-- No eval/exec or subprocess with shell=True usage without documented, reviewed justification.
-- CI contains the required security checks (bandit, semgrep, detect-secrets, pip-audit/safety) and is configured to fail on findings for banned patterns.
-- Pre-commit hooks configured (detect-secrets, semgrep, flake8/black).
+- No eval/exec or subprocess shell=True usage without a reviewed exception.
+- CI contains bandit, semgrep, detect-secrets, and pip-audit and is configured to fail on banned patterns.
+- Pre-commit hooks installed and passing (detect-secrets, semgrep, black/flake8).
 
-## Enforcement & Iteration
-- These rules are mandatory for the AI Code Assistant tool. Any generated code violating them must be rejected or automatically rewritten.
-- Maintain a monthly review process to update rulesets and semgrep patterns based on new findings or SCA reports.
-- Maintain a documented exemptions process: exceptions require a recorded security rationale, an owner, mitigation steps, and approval by a security reviewer.
+## Enforcement & Exceptions
+- Violations discovered in generated code must be auto-rewritten or rejected by the AI. Human exceptions require a documented security rationale in the PR, an owner, and compensating controls; the CI must still flag the exception.
+- Monthly rule-review to update semgrep rules, SCA tooling, and the instruction set.
 
 ## Quick Reference Examples
 - Safe HTTP:
@@ -291,13 +262,24 @@ cfg = yaml.safe_load(open("config.yaml"))
 - Safe password hashing:
 ```python
 from passlib.context import CryptContext
-pwd = CryptContext(schemes=["argon2"], deprecated="auto")
-pw_hash = pwd.hash("s3cr3t")
+pwd_ctx = CryptContext(schemes=["argon2"], deprecated="auto")
+pw_hash = pwd_ctx.hash("s3cr3t")
 ```
 - Safe subprocess:
 ```python
 import subprocess
-subprocess.run(["/usr/bin/convert", input_file, output_file], check=True)
+subprocess.run(["/usr/bin/ls", "-la"], check=True)
+```
+- Safe SQL:
+```python
+# psycopg2 parameterized query
+cursor.execute("INSERT INTO users (name, email) VALUES (%s, %s)", (name, email))
 ```
 
-By following these rules, the AI Code Assistant will not re-introduce the vulnerabilities found by the scan (hardcoded passwords, request without timeout, insecure hashing/deserialization, SQL injection, Flask debug enabled, shell execution risks, etc.). These guidelines are concise, actionable, and must be enforced in both generation and CI/pre-commit automation.
+## Required Repository Files (minimum)
+- .pre-commit-config.yaml (detect-secrets, semgrep, black)
+- .github/workflows/security.yml (CI with bandit, semgrep, detect-secrets, pip-audit)
+- .github/semgrep/p/ci/ (semgrep rule set detecting banned patterns)
+- detect-secrets baseline (.secrets.baseline) — reviewed and committed per policy
+
+By following these rules, the AI Code Assistant will prevent reintroduction of vulnerabilities flagged by the scan (hardcoded passwords, request without timeout, insecure deserialization, unsafe hashing, SQL injection, Flask debug enabled, shell execution risks, etc.). These instructions are mandatory and enforced via pre-commit and CI.
